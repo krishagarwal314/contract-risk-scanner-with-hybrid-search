@@ -14,6 +14,7 @@ from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 import uuid
 import uvicorn
+from sentence_transformers import CrossEncoder
 
 
 load_dotenv()
@@ -42,6 +43,8 @@ embedding = HuggingFaceEmbeddings(
 )
 
 model = init_chat_model("groq:llama-3.1-8b-instant", temperature = 0)
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2")
 
 
 risk_cats = {
@@ -124,12 +127,11 @@ async def upload(file: UploadFile = File(...)):
         embeddings = embedding,
         sparse_encoder = bm25,
         index = index,
-        top_k = 5,
+        top_k = 15,      #updated to 15 after the addition of reranking using a cross encoder in the new commit
         alpha=0.15,
         namespace=namespace,
     )
-    retriever.add_texts(texts=texts)
-
+    retriever.add_texts(texts=texts, namespace=namespace)
     retrievers[namespace] = retriever
 
     return {"status": "done", "session_id": namespace, "chunks": len(texts)}
@@ -137,6 +139,11 @@ async def upload(file: UploadFile = File(...)):
 class request_format(BaseModel):
     session_id: str
 
+def rerank(query: str, docs: list, top_n = 4) -> list: #new function of reranking in the new commit 
+    pairs = [(query, doc.page_content) for doc in docs]
+    scores = reranker.predict(pairs)
+    scored_docs = sorted(zip(docs, scores), key = lambda x: x[1], reverse = True)
+    return [doc for doc, score in scored_docs[:top_n]]
 
 @app.post("/scan")
 async def scan(request: request_format):
@@ -150,17 +157,16 @@ async def scan(request: request_format):
     results = {}
 
     for key, data in risk_cats.items():
-        docs = retriever.invoke(data["query"])
-
-        context = "\n\n".join(doc.page_content for doc in docs)
-
+        docs = retriever.invoke(data["query"])    #we get top 15 chunks based on the dot product 
+        reranked_docs = rerank(query = data["query"], docs = docs, top_n = 4)  #top 4 docs based on the results of cross encoder
+        context = "\n\n".join(doc.page_content for doc in reranked_docs)
         try:
             result = chain.invoke({
                 "category_label": data["label"],
                 "context": context,
             })
         except Exception as e:
-            print(f"ERROR on {key}: {e}")  # add this
+            print(f"ERROR on {key}: {e}")  
             result = {
                 "found": False,
                 "risk_level": "not_found",
@@ -181,4 +187,4 @@ async def scan(request: request_format):
     }
 
 if __name__ == "__main__":
-    uvicorn.run("app4:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=True)
