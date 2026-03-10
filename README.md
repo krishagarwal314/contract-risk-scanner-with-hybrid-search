@@ -1,111 +1,145 @@
-# Fact Verification RAG Assistant (Hybrid Search Edition)
+# Contract Risk Scanner
 
-This is a document fact-verification assistant built with Streamlit. You upload a PDF, ask a question, and the app tells you whether the document supports or contradicts your claim, along with the exact passage that backs up the answer.
-
-The original version of this project used FAISS for retrieval, which is a dense vector search approach. This version replaces that with a hybrid search setup using Pinecone, which combines both dense and sparse retrieval. The reason for the switch is explained below.
+A document analysis tool that scans uploaded contracts for risky clauses and returns a structured risk report. Built as an evolution of my earlier [Fact Verification RAG Assistant (Hybrid Search Edition)](https://github.com/krishagarwal314/Fact-Verification-RAG-Assistant-Hybrid-Search-Edition-), with two key architectural differences explained below.
 
 ---
 
-## Why Hybrid Search
+## What It Does
 
-The first version worked well for general documents. But when tested on something like the Dodd-Frank Act (a US financial regulation document, 850+ pages, dense with legal and financial terminology), it struggled. Dense vector search by itself is good at semantic similarity but it can miss exact legal terms, section references, or specific financial jargon. Hybrid search adds a keyword-matching layer on top, so when someone asks about a specific clause or a precise regulatory term, it actually finds the right passage instead of something that just sounds related.
+Upload a contract PDF. The system scans it for five risk categories and returns a structured breakdown:
+
+![Contract Risk Scanner Output](images_2/image.png)
+
+```
+Payment Terms:            medium — Payment is due 30 days after invoice date, with a 2% late fee.
+Termination Clause:       high   — Either party may terminate upon 30 days' written notice.
+Limitation of Liability:  high   — Liability capped at $100,000, may be insufficient for significant damages.
+Indemnification:          high   — Client indemnifies Consultant against all losses. No cap on liability.
+Governing Law:            medium — Disputes resolved through arbitration in the state of New York.
+```
 
 ---
 
-## Tech Used and What It Does
+## Risk Categories
 
-**LangChain**
-A framework for chaining together LLM calls, retrievers, and prompt templates. We use it to wire up the retriever, the prompt, the model, and the output parser into a single callable pipeline.
+| Category | What It Flags |
+|---|---|
+| Payment Terms | Net 90+, unusual due dates, late payment penalties |
+| Termination Clause | Missing clause, short or unreasonable notice periods |
+| Limitation of Liability | No cap, low cap, unlimited exposure |
+| Indemnification | One-sided clauses, no liability cap, broad scope |
+| Governing Law & Jurisdiction | Unfavorable jurisdiction, arbitration-only clauses |
 
-**Pinecone**
-A managed vector database. We store the document chunks here as vectors and retrieve them at query time. Unlike FAISS which lives in memory locally, Pinecone is cloud-hosted and persistent. The index is configured with `dotproduct` as the metric, which is required for hybrid search to work correctly with combined dense and sparse scores.
+---
 
-**PineconeHybridSearchRetriever**
-This is the core addition over v1. It sends both a dense embedding and a sparse BM25 vector to Pinecone and gets back results that are scored on both. The `alpha` parameter controls the balance, where `alpha=0.35` means 35% weight on semantic (dense) and 65% on keyword (sparse). For a legal document full of exact terminology, leaning toward keyword matching made more sense.
+## How It Works
 
-**BM25Encoder**
-BM25 stands for Best Match 25. It is a classical information retrieval algorithm from the pre-deep-learning era. It scores documents based on term frequency and inverse document frequency (TF-IDF style). You fit it on your corpus first, then it converts any query or document chunk into a sparse vector where each dimension corresponds to a vocabulary term. This is what gives the retriever its keyword-matching ability. We fit it on all the text chunks from the uploaded PDF and dump the learned values to `bm25_values.json` so they can be reloaded.
+```
+PDF Upload
+   ↓
+Chunk (800 , 150 overlap) via RecursiveCharacterTextSplitter
+   ↓
+BM25Encoder.fit(chunks)       → sparse vectors (fitted on this document)
+HuggingFace all-MiniLM-L6-v2 → dense vectors (384d)
+   ↓
+Pinecone Hybrid Index (dotproduct metric, per-session namespace)
+   ↓
+For each risk category:
+   keyword-dense retrieval query → PineconeHybridSearchRetriever (alpha=0.15)
+   top-5 chunks → Groq LLaMA 3.1 8B Instant
+   structured JSON output: { found, risk_level, summary, flag }
+   ↓
+Aggregated Risk Report: { high, medium, low } + per-clause breakdown
+```
 
-**HuggingFace Embeddings (all-MiniLM-L6-v2)**
-This model converts text into dense 384-dimensional vectors that capture semantic meaning. Two sentences that mean the same thing even with different words will have similar vectors. This is the "dense" side of the hybrid search pair.
+---
 
-**Dense vs Sparse Vectors**
-Dense vectors are fixed-size floating point arrays where every dimension has a value. Sparse vectors have mostly zeros, with nonzero values only at positions corresponding to words that actually appear. Dense is good for meaning, sparse is good for exact term matching. Hybrid search uses both.
+## Key Design Decisions
 
-**RecursiveCharacterTextSplitter**
-Splits documents into smaller chunks before embedding. We used 800-character chunks with 150-character overlap. The overlap ensures that sentences split across chunk boundaries are not lost from context.
+### 1. alpha = 0.15 (vs 0.35 in the previous project)
 
-**RAG (Retrieval Augmented Generation)**
-The overall pattern here. Instead of asking the LLM to answer from its training data, we retrieve relevant chunks from the actual document and pass them as context in the prompt. This means the LLM is grounded in the document's content and cannot make things up from general knowledge.
+The previous project (Fact Verification RAG Assistant) used `alpha=0.35` — a 35/65 split between semantic and keyword search. That worked well for general document Q&A where meaning matters as much as exact terms.
 
-**Groq + LLaMA 3.1 8B**
-We use Groq as the inference provider for the LLaMA 3.1 8B Instant model. Groq offers very fast inference speeds which makes the response feel close to real-time even for a document this large.
+Contracts are different. Legal language is precise and non-negotiable — "indemnification", "governing law", "limitation of liability" are exact clause names, not concepts that can be paraphrased. A retriever that leans on semantic similarity risks returning loosely related passages instead of the actual clause. With `alpha=0.15`, the retriever is 85% keyword-driven, which is the right tradeoff for legal documents.
 
-**Streamlit**
-Used for the front-end. Handles file upload, chat interface, and session state management to persist the retriever across messages without re-indexing the document on each question.
+### 2. Keyword-dense retrieval queries (not user queries)
+
+Each risk category has a crafted retrieval query designed for BM25 matching, not natural language:
+
+```python
+"payment_terms": "payment terms invoice due date net 30 net 60 net 90 late payment interest billing schedule"
+```
+
+These are not questions — they are normalized, keyword-dense strings that maximize term overlap with how legal clauses are actually written. BM25Encoder handles internal text normalization (tokenization, stopword removal, term frequency weighting) when fitted on the document corpus. This approach consistently outperforms asking the retriever a natural language question like "what are the payment terms?" for domain-specific legal retrieval.
+
+
+### 3. Structured JSON output per clause
+
+Instead of a free-form answer, the LLM is prompted to return a fixed schema for every category:
+
+```json
+{
+  "found": true,
+  "risk_level": "high",
+  "summary": "Client indemnifies Consultant against all losses including attorney fees.",
+  "flag": "No cap on liability"
+}
+```
+
+This makes the output programmatically usable — countable, filterable, exportable — rather than just readable.
+
+### 4. Per-session Pinecone namespaces
+
+Each upload gets a `uuid4()` namespace in Pinecone. Multiple users can upload different contracts simultaneously without their vectors colliding in the same index.
+
+---
+
+## Tech Stack
+
+| Tool | Role |
+|---|---|
+| FastAPI | Backend API (`/upload`, `/scan`) |
+| Streamlit | Frontend UI |
+| Pinecone | Cloud vector DB with hybrid (dense + sparse) index |
+| BM25Encoder | Sparse keyword vectors, fitted on document corpus |
+| HuggingFace all-MiniLM-L6-v2 | Dense semantic embeddings (384d) |
+| PineconeHybridSearchRetriever | Combines dense + sparse with `alpha=0.15` |
+| Groq + LLaMA 3.1 8B Instant | Fast structured JSON extraction |
+| LangChain | Chains prompt → LLM → JsonOutputParser |
+
+---
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+Create `.env`:
+```
+GROQ_API_KEY=your_groq_key
+pinecone_key=your_pinecone_key
+```
+
+Run backend:
+```bash
+uvicorn app2:app --reload
+```
+
+Run frontend:
+```bash
+streamlit run frontend.py
+```
 
 ---
 
 ## Project Structure
 
 ```
-REIMP/
-|-- app2.py              # Main application (hybrid search version)
-|-- app.py               # Original FAISS version
-|-- bm25_values.json     # Fitted BM25 encoder weights (generated at runtime)
-|-- images_2/
-|   |-- yes.png          # Output screenshot showing a supported claim
-|   |-- yessrc.png       # Output screenshot showing source evidence
-|-- input_pdf/           # Sample input PDFs
-|-- .env                 # API keys (not committed)
-|-- requirements.txt
-|-- pyproject.toml
-|-- README.md
+.
+├── backend.py          # FastAPI backend
+├── frontend.py      # Streamlit frontend
+├── requirements.txt
+├── .env             # API keys (not committed)
+└── README.md
 ```
-
----
-
-## Sample Document Tested
-
-The primary test document was the Dodd-Frank Wall Street Reform and Consumer Protection Act (Public Law 111-203), a 850+ page US federal financial regulation statute. This was deliberately chosen because it is the kind of document where traditional dense-only retrieval tends to underperform. The document is full of precise legal language, section cross-references, and financial industry terms that need exact keyword matching to retrieve correctly.
-
-PDF source: https://www.govinfo.gov/content/pkg/PLAW-111publ203/pdf/PLAW-111publ203.pdf
-
-The retriever was able to return accurate and well-grounded passages from within such a large document, along with the exact source evidence the LLM used to answer. The prompt is structured to refuse answering if the context does not contain the claim, which prevents hallucination.
-
-**Claim verified as supported:**
-
-![Supported claim output](images_2/yes.png)
-
-**Source evidence returned:**
-
-![Source evidence output](images_2/yessrc.png)
-
----
-
-## Setup
-
-1. Clone the repo
-2. Create a `.env` file with:
-```
-GROQ_API_KEY=your_groq_key
-pinecone_key=your_pinecone_key
-```
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-4. Run:
-```bash
-streamlit run app2.py
-```
-
----
-
-## What I Learned
-
-The main takeaway from this project is that retrieval strategy matters a lot depending on the document type. Dense vector search alone is sufficient for most general Q&A scenarios, but for domain-specific documents (legal, financial, medical) where exact terminology is significant, combining it with sparse keyword search gives noticeably better results.
-
-I also learned that tuning the `alpha` parameter for hybrid search is not trivial. It depends entirely on the document and the kinds of queries you expect. For the Dodd-Frank Act, keywords mattered more than semantic similarity, so a lower alpha worked better.
-
-Another thing that became clear is how important the prompt structure is for a fact-verification use case specifically. The model needs to be explicitly told not to use external knowledge and to respond with "not supported by document" rather than guessing. Without that guardrail the outputs are not trustworthy for verification purposes.
