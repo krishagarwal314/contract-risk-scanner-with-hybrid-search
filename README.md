@@ -46,7 +46,8 @@ Pinecone Hybrid Index (dotproduct metric, per-session namespace)
    ↓
 For each risk category:
    keyword-dense retrieval query → PineconeHybridSearchRetriever (alpha=0.15)
-   top-5 chunks → Groq LLaMA 3.1 8B Instant
+   top-15 chunks → CrossEncoder reranker (ms-marco-MiniLM-L-12-v2) → top-4  ← added in last commit
+   top-4 chunks → Groq LLaMA 3.1 8B Instant
    structured JSON output: { found, risk_level, summary, flag }
    ↓
 Aggregated Risk Report: { high, medium, low } + per-clause breakdown
@@ -72,8 +73,11 @@ Each risk category has a crafted retrieval query designed for BM25 matching, not
 
 These are not questions — they are normalized, keyword-dense strings that maximize term overlap with how legal clauses are actually written. BM25Encoder handles internal text normalization (tokenization, stopword removal, term frequency weighting) when fitted on the document corpus. This approach consistently outperforms asking the retriever a natural language question like "what are the payment terms?" for domain-specific legal retrieval.
 
+### 3. Cross-encoder reranking *(added in last commit)*
 
-### 3. Structured JSON output per clause
+After retrieving the top-15 chunks from Pinecone, a `CrossEncoder (ms-marco-MiniLM-L-12-v2)` reranks them and keeps only the top 4. Unlike the bi-encoder embeddings used for retrieval, a cross-encoder scores each (query, chunk) pair jointly, making it significantly more accurate at identifying the most relevant passages. The tradeoff is speed — cross-encoders are too slow to run over the full index, so they're applied only after the initial retrieval narrows the candidate set.
+
+### 4. Structured JSON output per clause
 
 Instead of a free-form answer, the LLM is prompted to return a fixed schema for every category:
 
@@ -88,7 +92,7 @@ Instead of a free-form answer, the LLM is prompted to return a fixed schema for 
 
 This makes the output programmatically usable — countable, filterable, exportable — rather than just readable.
 
-### 4. Per-session Pinecone namespaces
+### 5. Per-session Pinecone namespaces
 
 Each upload gets a `uuid4()` namespace in Pinecone. Multiple users can upload different contracts simultaneously without their vectors colliding in the same index.
 
@@ -104,6 +108,7 @@ Each upload gets a `uuid4()` namespace in Pinecone. Multiple users can upload di
 | BM25Encoder | Sparse keyword vectors, fitted on document corpus |
 | HuggingFace all-MiniLM-L6-v2 | Dense semantic embeddings (384d) |
 | PineconeHybridSearchRetriever | Combines dense + sparse with `alpha=0.15` |
+| CrossEncoder ms-marco-MiniLM-L-12-v2 | Reranks top-15 chunks to top-4 *(added in last commit)* |
 | Groq + LLaMA 3.1 8B Instant | Fast structured JSON extraction |
 | LangChain | Chains prompt → LLM → JsonOutputParser |
 
